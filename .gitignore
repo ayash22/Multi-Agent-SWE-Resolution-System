@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+*.egg
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Node / frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# --- Generated data & model artifacts (large, not source) ---
+data/swebench/raw/
+data/finetune/raw_trajectories.jsonl
+data/finetune/sft_dataset.jsonl
+finetuning/checkpoints/
+finetuning/merged/
+.index_cache/
+patch_ranking/ranker_model.pkl
+
+# --- Evaluation outputs ---
+evaluation/predictions/
+logs/
+mlruns/
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+*.swp

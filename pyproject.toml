@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["tests/fixtures", "finetuning/checkpoints", "finetuning/merged", ".index_cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # line length handled loosely; long prompts/docstrings are common here
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["tests/fixtures", ".git", "node_modules", ".index_cache"]

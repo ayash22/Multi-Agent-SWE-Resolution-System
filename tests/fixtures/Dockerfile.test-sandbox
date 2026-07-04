@@ -1,0 +1,11 @@
+# Minimal fixture image for tests/test_docker_sandbox_integration.py -- a
+# tiny fake "repo" with a deliberately buggy calc.py and a test that fails
+# against it, so the integration test can prove the sandbox correctly
+# applies a fix patch and re-runs the test to a passing state.
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir pytest
+WORKDIR /repo
+COPY calc.py test_calc.py ./
+RUN git init -q && git config user.email t@example.com && git config user.name Test \
+    && git add . && git commit -q -m "init"

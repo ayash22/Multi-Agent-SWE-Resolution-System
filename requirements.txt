@@ -1,0 +1,43 @@
+# --- Core ---
+python-dotenv==1.0.1
+
+# --- Agent framework & LLM clients ---
+langgraph==0.1.19
+langchain-core==0.2.38
+langsmith==0.1.98
+openai==1.43.0
+requests==2.32.3
+
+# --- Retrieval ---
+faiss-cpu==1.8.0.post1
+rank_bm25==0.2.2
+sentence-transformers==3.0.1
+tree_sitter==0.21.3
+tree_sitter_languages==1.10.2
+numpy==1.26.4
+
+# --- Sandboxing ---
+docker==7.1.0
+
+# --- Patch ranking ---
+scikit-learn==1.5.1
+
+# --- Fine-tuning (GPU required; install separately if you don't have one) ---
+torch==2.3.1
+transformers==4.44.2
+peft==0.12.0
+trl==0.9.6
+bitsandbytes==0.43.3
+datasets==2.20.0
+accelerate==0.33.0
+
+# --- Experiment tracking ---
+mlflow==2.15.1
+
+# --- Evaluation ---
+swebench==2.0.9
+
+# --- Serving ---
+fastapi==0.112.1
+uvicorn[standard]==0.30.6
+pydantic==2.8.2

@@ -1,0 +1,43 @@
+# Sandbox image for executing a single SWE-bench instance's repo + tests in
+# isolation. Built once per (repo, base_commit) pair and reused across all N
+# candidate patches for that instance (each candidate still gets its own
+# ephemeral *container*, but they share this image, so `docker build` only
+# pays the clone+install cost once per instance).
+#
+# Build:
+#   docker build -t swe-sandbox:<repo>-<commit> \
+#     --build-arg REPO=django/django \
+#     --build-arg COMMIT=abc1234 \
+#     --build-arg PYTHON_VERSION=3.11 \
+#     -f sandbox/Dockerfile.sandbox .
+
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim
+
+ARG REPO
+ARG COMMIT
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /repo
+
+# Clone at the exact commit the issue was opened against -- this is what the
+# official SWE-bench harness does too, so results here are directly
+# comparable to the official evaluation.
+RUN git clone https://github.com/${REPO}.git . \
+    && git checkout ${COMMIT}
+
+# Editable install + test dependencies. Most SWE-bench repos expose their
+# test extras via `pip install -e .[test]` or a requirements-dev.txt; we try
+# both and don't fail the build if one doesn't apply.
+RUN pip install --no-cache-dir -e ".[test]" 2>/dev/null || \
+    pip install --no-cache-dir -e . 2>/dev/null || true
+RUN pip install --no-cache-dir pytest pytest-timeout 2>/dev/null || true
+RUN if [ -f requirements-dev.txt ]; then pip install --no-cache-dir -r requirements-dev.txt; fi
+
+# No CMD/ENTRYPOINT: docker_executor.py starts the container with
+# `sleep infinity` and drives everything via `exec_run`, so the container
+# stays alive just long enough to apply the patch and run the target tests,
+# then gets force-removed.

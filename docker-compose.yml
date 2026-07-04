@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: serving/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - LLAMA_SERVER_URL=http://ollama:11434
+      - LLAMA_BACKEND=ollama
+      - CORS_ORIGINS=http://localhost:5173
+      # NOTE: the sandbox nodes shell out to the Docker SDK to launch
+      # *sibling* containers for patch execution. That requires either:
+      #   (a) mounting the host Docker socket into this container
+      #       (-v /var/run/docker.sock:/var/run/docker.sock), which is what
+      #       the volume below does for local/dev use, or
+      #   (b) running the backend directly on a host with Docker installed,
+      #       which is what we recommend for evaluation runs and what the
+      #       README documents for the Railway deployment (Railway does not
+      #       expose a Docker socket to app containers, so sandbox execution
+      #       during a live deployed demo is out of scope -- see README).
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - mlflow
+      - ollama
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.15.1
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri /mlruns
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlruns
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # After starting: `docker exec -it <ollama_container> ollama pull llama3:8b-instruct`
+    # and, once fine-tuned + merged + GGUF-converted:
+    # `ollama create swe-llama3-qlora -f finetuning/merged/swe-llama3-merged/Modelfile`
+
+volumes:
+  mlflow_data:
+  ollama_data:
