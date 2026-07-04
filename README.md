@@ -22,6 +22,7 @@ evaluation harness.
 
 - [Honest status: what's been run vs. what needs your infra](#honest-status)
 - [Running this for real](#running-this-for-real)
+- [Guardrails against hallucination and infinite loops](#guardrails)
 - [Architecture](#architecture)
 - [AST-aware chunking vs. naive text chunking](#ast-aware-chunking)
 - [QLoRA fine-tuning methodology](#qlora-fine-tuning-methodology)
@@ -49,14 +50,14 @@ Given that, here's exactly what is and isn't verified:
 | Component | Status |
 |---|---|
 | AST-aware chunker (`retrieval/ast_chunker.py`) | ✅ Covered by 7 automated tests (`tests/test_ast_chunker.py`) — correct function/class/method boundaries, exact line numbers, import attribution, docstring extraction, large-function splitting |
-| LangGraph state machine (`agents/graph.py`) | ✅ Covered by 6 automated tests (`tests/test_graph.py`) — graph compiles, correct nodes present, correct fan-out/fan-in edges, correct retry routing |
+| LangGraph state machine (`agents/graph.py`) | ✅ Covered by 8 automated tests (`tests/test_graph.py`) — graph compiles, correct nodes present, correct fan-out/fan-in edges, correct retry routing, bounded recursion limit enforced, graceful handling of a hit recursion limit |
 | Patch ranker (`patch_ranking/`) | ✅ Covered by 5 automated tests (`tests/test_patch_ranker.py`) — feature extraction shape/values, fallback heuristic correctly ranks passing > partial > invalid, deterministic scoring |
 | Verifier reconciliation logic | ✅ Covered by 5 automated tests (`tests/test_verifier_agent.py`), including a regression test for a real bug caught during development (see below) |
-| Diff extraction / `git apply --check` validation | ✅ Covered by 7 automated tests (`tests/test_coder_agent.py`) against a real throwaway git repo — not mocked |
-| Docker sandbox pure helpers (pytest output parsing, tar packaging) | ✅ Covered by 3 automated tests (`tests/test_docker_sandbox_helpers.py`) |
+| Diff extraction / `git apply --check` validation / size guardrail | ✅ Covered by 10 automated tests (`tests/test_coder_agent.py`) against a real throwaway git repo — not mocked |
+| Docker sandbox pure helpers + watchdog timeout | ✅ Covered by 4 automated tests (`tests/test_docker_sandbox_helpers.py`), including a mocked-hang test proving the watchdog fires within ~6s instead of hanging indefinitely |
 | Docker sandbox live container execution | ⚠️ Integration test exists (`tests/test_docker_sandbox_integration.py`) but **auto-skips honestly** — no Docker daemon in the environment that built this repo. Verified it reports `SKIPPED` with a clear reason rather than silently passing. |
-| FastAPI backend | ✅ **Actually started and hit with real HTTP requests** during development: `/health` returns 200; `/api/eval/summary` correctly returns 404 with an honest message when no evaluation has run (no fabricated numbers served); `/api/issues/resolve` against a nonexistent repo fails with a real `git clone` error; against a real repo (`octocat/Hello-World`) it genuinely clones the repo at the given commit, runs the LangGraph pipeline, and fails cleanly at the planner node with "OPENAI_API_KEY is not set" — proving the full request path is real, not mocked, up to the external-API boundary |
-| React frontend | ✅ **Actually built**: `npm install && npm run build` produces a real production bundle (`dist/index.html`, ~212KB JS, ~11KB CSS) with zero TypeScript errors. One real bug was found and fixed during this build (`import.meta.env` needed a `vite-env.d.ts` type declaration) — see below. |
+| FastAPI backend | ✅ **Actually started and hit with real HTTP requests** during development: `/health` returns 200; `/api/eval/summary` correctly returns 404 with an honest message when no evaluation has run (no fabricated numbers served); `/api/issues/resolve` against a nonexistent repo fails with a real `git clone` error; against a real repo (`octocat/Hello-World`) it genuinely clones the repo at the given commit, runs the LangGraph pipeline, and fails cleanly at the planner node with "OPENAI_API_KEY is not set" — proving the full request path is real, not mocked, up to the external-API boundary. Re-verified after the guardrail changes below. |
+| React frontend | ✅ **Actually built**, twice (initial build and re-verified after all guardrail changes): `npm install && npm run build` produces a real production bundle (`dist/index.html`, ~212KB JS, ~11KB CSS) with zero TypeScript errors. |
 | GPT-4o planner / coder calls | ⚠️ **Not executed** — requires your `OPENAI_API_KEY` |
 | Fine-tuned Llama-3 (QLoRA) | ⚠️ **Not trained** — requires a GPU (see [QLoRA methodology](#qlora-fine-tuning-methodology)); `llama_coder_agent` auto-falls-back to base `llama3:8b-instruct` via Ollama and labels output `llama3_base_fallback` when no fine-tuned checkpoint exists, so this is never silently swapped in |
 | SWE-bench Lite download + 90-instance sample | ⚠️ **Not run** — requires network access to `huggingface.co` |
@@ -95,6 +96,29 @@ the first draft was perfect:
    "corrupt patch." This was a bug in the *test fixture*, not the
    `check_applies_cleanly` function under test — fixed the fixture and
    confirmed the underlying function is correct.
+6. **Sandbox timeout could be bypassed by a silent hang** — found during a
+   dedicated audit of loop-related guardrails: the original watchdog only
+   checked the deadline between output chunks, so a patch causing a test to
+   hang with zero output would never time out. See [Guardrails](#guardrails)
+   for the full writeup and the regression test that now proves the fix.
+7. **No output-length bounds or repetition guardrails on any LLM call** —
+   none of the three prompts capped `max_tokens`, and the Llama-3 coder call
+   had no repetition penalty or stop sequence, both real risk factors for
+   degenerate/runaway generation from a smaller fine-tuned model. Added
+   explicit caps, a repetition penalty, and a stop sequence matching the
+   fine-tuning chat format (see [Guardrails](#guardrails)).
+8. **Prompts didn't explicitly forbid hallucinating file/function names** —
+   the original prompts asked for a "minimal, correct" patch but never told
+   the model to ground every reference in the provided context. Added
+   explicit grounding rules to all three system prompts, plus a
+   patch-size sanity cap and stricter planner schema validation, as
+   defense in depth alongside the existing `git apply --check` gate.
+9. **No LangGraph-level recursion ceiling** — retries were bounded only by
+   application-level `retry_count`/`max_retries` logic; a bug in that
+   counter could theoretically loop indefinitely. Added an explicit
+   `recursion_limit` passed to every graph invocation as a structurally
+   independent second guardrail, with `GraphRecursionError` caught and
+   converted to a clean failed state.
 
 ---
 
@@ -148,7 +172,42 @@ CI (`.github/workflows/ci.yml`) runs `ruff check .`, the full pytest suite,
 and a real frontend `npm run build` on every push/PR — the same commands
 above, verified automatically.
 
+---
 
+## Guardrails
+
+Every LLM call and every loop in this system has explicit, tested bounds.
+This section lists them by failure mode, with a pointer to the test that
+proves each one, rather than just asserting they exist.
+
+### Against hallucination
+
+| Guardrail | Where | Why |
+|---|---|---|
+| **Grounding instructions in every prompt** | `PLANNER_SYSTEM_PROMPT`, `CODER_SYSTEM_PROMPT`, `llama_coder_agent.SYSTEM_PROMPT` | Each prompt explicitly forbids inventing file paths, function names, imports, or code that wasn't shown in the retrieved context or issue text, and requires every unchanged diff line to be copied verbatim from the provided code rather than reconstructed from memory. The planner is separately told to leave `likely_files` empty rather than guess a plausible-sounding path, since a wrong guess there is worse than no guess (retrieval doesn't depend on it). |
+| **Schema validation on the planner's output** | `agents/nodes/planner_agent.py::plan_issue` | A malformed or incomplete JSON response raises immediately with the raw output attached, rather than silently defaulting missing fields to empty strings and letting bad data flow downstream. |
+| **`git apply --check` as a hard gate** | `agents/nodes/coder_agent.py::check_applies_cleanly` | The single strongest anti-hallucination check in the system: if a patch references a file, line, or context that doesn't actually exist in the checked-out repo, `git apply --check` fails and the candidate is marked `applies_cleanly=False` — automatically excluded by the verifier regardless of how plausible the diff looked. Tested against a real git repo in `tests/test_coder_agent.py`. |
+| **Implausible-patch-size rejection** | `agents/nodes/coder_agent.py::is_implausibly_large`, reused by `llama_coder_agent.py` | A patch touching more than 300 lines is treated as a signal of ungrounded/runaway generation for this benchmark (genuine SWE-bench-Lite fixes are almost always small) and is rejected before ever reaching the sandbox. Tested in `tests/test_coder_agent.py`. |
+| **Genuine-pass verification, not just "didn't crash"** | `agents/nodes/verifier_agent.py::is_valid_patch` | Requires `test_result.passed is True` AND zero failed tests — a patch that "passes" only because it deleted or skipped the target test is rejected. Tested in `tests/test_verifier_agent.py::test_is_valid_patch_rejects_gamed_test_removal`. |
+
+### Against infinite loops / runaway execution
+
+| Guardrail | Where | Why |
+|---|---|---|
+| **Bounded self-correction retries** | `agents/nodes/patch_ranker.py::select_best_candidate` | Hard `max_retries` (default 3) enforced in application logic — after that, the pipeline returns the best partial candidate with `resolved=False` rather than retrying forever. |
+| **LangGraph-level recursion limit (defense in depth)** | `agents/graph.py::run_instance` | An explicit `recursion_limit=60` is passed to every graph invocation, independent of the retry-count logic above — if a future bug ever broke that counter, this is a second, structurally separate ceiling that still guarantees termination. `GraphRecursionError` is caught and converted into a clean failed state rather than propagating as an unhandled exception. Both the limit being passed and the graceful-failure behavior are tested in `tests/test_graph.py`. |
+| **Watchdog-thread-based sandbox timeout** | `sandbox/docker_executor.py::DockerSandbox.run_patch_and_tests` | **A real bug caught during audit**: the original implementation only checked the wall-clock deadline *between* chunks read from the container's output stream, so a patch causing a test to hang with zero output (a plausible failure mode — an infinite loop with no print statements) would never actually time out, since the read loop blocks indefinitely waiting for a chunk that never comes. Fixed with a background watchdog thread using `thread.join(timeout=...)`, which fires regardless of output activity, plus a shell-level `timeout` wrapper around the test command as defense in depth. `tests/test_docker_sandbox_helpers.py::test_watchdog_fires_on_hang_with_zero_output` simulates exactly this hang against a mocked Docker client and asserts the call returns in ~6 seconds instead of hanging for a simulated 30-second freeze. |
+| **Docker resource caps** | `sandbox/docker_executor.py` (`mem_limit`, `nano_cpus`) | Bounds memory and CPU per sandbox container, so a generated patch that spawns a fork bomb or an unbounded-memory loop can't affect anything beyond its own container, which is killed at the timeout regardless. |
+| **`network_disabled=True`** | `sandbox/docker_executor.py` | The sandbox container has no outbound network access at all, so a hallucinated or malicious patch can't exfiltrate data or fetch/execute additional code from the internet. |
+| **Bounded LLM output length** | All three system prompts' call sites (`PLANNER_MAX_OUTPUT_TOKENS=1000`, `CODER_MAX_OUTPUT_TOKENS=2000`, `LLAMA_MAX_OUTPUT_TOKENS=1500`) | Caps how much a single call can generate, independent of the model's own stopping behavior. |
+| **Repetition penalty + explicit stop sequence for the Llama-3 coder** | `agents/nodes/llama_coder_agent.py` (`repeat_penalty=1.15` / `repetition_penalty`, `stop=["<\|eot_id\|>"]`) | Smaller open-weight models are meaningfully more prone than GPT-4o to degenerate repetition loops (repeating the same line/token sequence until the context window is exhausted). The repetition penalty discourages this directly; the stop sequence (matching the fine-tuning chat format) halts generation at the natural end of the assistant turn instead of letting it continue past a complete diff. |
+| **Explicit request-level timeouts on every external call** | `PLANNER_REQUEST_TIMEOUT_SECONDS=60`, `CODER_REQUEST_TIMEOUT_SECONDS=90`, `LLAMA_REQUEST_TIMEOUT_SECONDS=120`, GitHub API fetch (15s) | No HTTP call in the pipeline can hang indefinitely waiting on a stalled upstream service. |
+
+None of the loop-related guardrails above are theoretical — the watchdog
+fix in particular was a genuine bug found by actually reasoning through what
+happens when a sandboxed test hangs with no output, not a hypothetical
+listed for completeness. It's now covered by a test that fails if the fix
+regresses.
 
 ---
 

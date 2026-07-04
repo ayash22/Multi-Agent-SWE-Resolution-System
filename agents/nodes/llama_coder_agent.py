@@ -23,7 +23,12 @@ import re
 
 import requests
 
-from agents.nodes.coder_agent import _format_context, check_applies_cleanly, validate_syntax
+from agents.nodes.coder_agent import (
+    _format_context,
+    check_applies_cleanly,
+    is_implausibly_large,
+    validate_syntax,
+)
 from agents.state import PatchCandidateDict, SWEAgentState
 
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://localhost:11434")
@@ -31,11 +36,32 @@ LLAMA_MODEL_NAME = os.environ.get("LLAMA_MODEL_NAME", "swe-llama3-qlora")
 LLAMA_BASE_FALLBACK = os.environ.get("LLAMA_BASE_FALLBACK", "llama3:8b-instruct")
 LLAMA_BACKEND = os.environ.get("LLAMA_BACKEND", "ollama")  # "ollama" | "vllm"
 
+# Smaller open-weight models (Llama-3-8B included) are meaningfully more
+# prone than GPT-4o to degenerate repetition loops -- e.g. repeating the
+# same line or token sequence until the context window is exhausted. A hard
+# output-token cap and an explicit repetition penalty are the two concrete
+# guardrails against that failure mode; the stop sequence below matches the
+# fine-tuning chat format (see data/finetune/prepare_finetune_data.py) so
+# generation halts at the natural end of the assistant turn rather than
+# continuing to hallucinate additional unrelated content.
+LLAMA_MAX_OUTPUT_TOKENS = 1500
+LLAMA_REPETITION_PENALTY = 1.15
+LLAMA_STOP_SEQUENCES = ["<|eot_id|>"]
+LLAMA_REQUEST_TIMEOUT_SECONDS = 120
+
 SYSTEM_PROMPT = (
     "You are an expert software engineer. Given a GitHub issue and relevant "
     "code context, produce a minimal, correct unified diff patch that "
     "resolves the issue. The patch must be directly applicable with "
-    "`git apply`. Do not change more code than necessary."
+    "`git apply`. Do not change more code than necessary.\n\n"
+    "Grounding rules: only reference file paths, function names, and code "
+    "that literally appear in the provided context below or are explicitly "
+    "named in the issue text. Do not invent helper functions, imports, or "
+    "APIs that are not shown to you. Every unchanged (context) line in your "
+    "diff hunks must be copied verbatim from the code you were given, not "
+    "reconstructed from memory. Output ONLY the diff, once, inside a single "
+    "```diff ... ``` block -- do not repeat the diff or continue generating "
+    "after it is complete."
 )
 
 
@@ -59,9 +85,17 @@ def _call_ollama(model_name: str, prompt: str) -> str:
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
-            "options": {"temperature": 0.2, "num_ctx": 4096},
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": 4096,
+                # Hard cap on generated tokens -- guardrail against
+                # repetition loops / runaway generation (see module docstring).
+                "num_predict": LLAMA_MAX_OUTPUT_TOKENS,
+                "repeat_penalty": LLAMA_REPETITION_PENALTY,
+                "stop": LLAMA_STOP_SEQUENCES,
+            },
         },
-        timeout=180,
+        timeout=LLAMA_REQUEST_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
     return resp.json()["message"]["content"]
@@ -73,13 +107,18 @@ def _call_vllm(model_name: str, prompt: str) -> str:
         json={
             "model": model_name,
             "temperature": 0.2,
-            "max_tokens": 1024,
+            "max_tokens": LLAMA_MAX_OUTPUT_TOKENS,
+            # vLLM's OpenAI-compatible endpoint supports repetition_penalty
+            # as an extra (non-standard-OpenAI) field, same rationale as
+            # the Ollama `repeat_penalty` above.
+            "repetition_penalty": LLAMA_REPETITION_PENALTY,
+            "stop": LLAMA_STOP_SEQUENCES,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
         },
-        timeout=180,
+        timeout=LLAMA_REQUEST_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
@@ -133,6 +172,9 @@ def generate_patch_llama(state: SWEAgentState) -> PatchCandidateDict:
 
     patch_text = _extract_diff(raw)
     syntax_valid = validate_syntax(patch_text)
+    if syntax_valid and is_implausibly_large(patch_text):
+        syntax_valid = False
+
     applies = False
     if syntax_valid and state.get("repo_local_path"):
         applies = check_applies_cleanly(patch_text, state["repo_local_path"])

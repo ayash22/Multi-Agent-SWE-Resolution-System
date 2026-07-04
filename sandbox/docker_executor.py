@@ -9,17 +9,32 @@ between runs.
 Safety properties enforced here:
   - `network_disabled=True`      -- no outbound network from inside the sandbox
   - `mem_limit` / `nano_cpus`     -- resource caps to prevent fork-bombs / OOM
-  - hard 60s wall-clock timeout, container killed and removed if exceeded
+  - HARD, watchdog-thread-based 60s wall-clock timeout that fires
+    unconditionally (see note below on why a naive "check the clock between
+    output chunks" approach is not sufficient), container killed and removed
+    if exceeded
+  - a shell-level `timeout` wrapper around the test command as defense in
+    depth, independent of the Python-side watchdog
   - container always removed in a `finally` block (`remove=True` + explicit
     `container.remove(force=True)` fallback), so no state leaks between runs
   - patch is written to a temp file and copied in via `put_archive`, never
     interpolated into a shell string (avoids shell-injection from patch
     content)
+
+Why a watchdog thread and not just "check elapsed time in the read loop":
+if a generated patch causes a test to hang and produce ZERO output (e.g. an
+infinite loop with no print statements, or a deadlock), a loop of the form
+`for chunk in exec_stream: ...; if time.time() > deadline: break` never gets
+a chance to check the deadline, because iterating the generator blocks
+indefinitely waiting for the next chunk that never arrives. A background
+thread with `thread.join(timeout=...)` enforces the wall-clock limit
+regardless of whether the sandboxed process ever produces output.
 """
 from __future__ import annotations
 
 import io
 import tarfile
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -29,6 +44,7 @@ from docker.errors import ContainerError, ImageNotFound
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_MEM_LIMIT = "2g"
 DEFAULT_NANO_CPUS = 2_000_000_000  # 2 CPUs
+WATCHDOG_GRACE_SECONDS = 5  # extra time given to the kill+cleanup sequence itself
 
 
 @dataclass
@@ -123,33 +139,76 @@ class DockerSandbox:
                 )
 
             test_target = " ".join(test_ids) if test_ids else ""
-            cmd = f"pytest -v --no-header {test_target}".strip()
+            # Defense in depth #1: a shell-level `timeout` wraps the test
+            # command itself, so even if the Python-side watchdog below were
+            # ever bypassed, the in-container process is still bounded.
+            # `coreutils` (providing `timeout`) ships in python:*-slim by default.
+            cmd = f"timeout {self.timeout_seconds}s pytest -v --no-header {test_target}".strip()
 
             exec_id = self.client.api.exec_create(container.id, cmd, workdir=repo_workdir)
-            exec_stream = self.client.api.exec_start(exec_id, stream=True)
 
-            output_chunks = []
-            deadline = start + self.timeout_seconds
-            timed_out = False
-            for chunk in exec_stream:
-                output_chunks.append(chunk)
-                if time.time() > deadline:
-                    timed_out = True
-                    break
+            # Defense in depth #2 (the one that actually matters): run the
+            # blocking exec_start call in a background thread and enforce
+            # the wall-clock timeout with `thread.join(timeout=...)`. This
+            # fires even if the sandboxed process produces zero output and
+            # never enters a read loop that could check the clock -- see
+            # the module docstring for why the naive "check between chunks"
+            # approach is insufficient.
+            result_holder: dict = {}
 
-            if timed_out:
-                container.kill()
-                stdout = b"".join(output_chunks).decode(errors="ignore")
+            def _run_exec():
+                try:
+                    output = self.client.api.exec_start(exec_id, stream=False)
+                    result_holder["stdout"] = output.decode(errors="ignore")
+                    result_holder["exit_code"] = self.client.api.exec_inspect(exec_id).get("ExitCode", -1)
+                except Exception as exec_err:  # noqa: BLE001 -- surfaced via result_holder, not swallowed
+                    result_holder["error"] = str(exec_err)
+
+            worker = threading.Thread(target=_run_exec, daemon=True)
+            worker.start()
+            worker.join(timeout=self.timeout_seconds + WATCHDOG_GRACE_SECONDS)
+
+            if worker.is_alive():
+                # Hard timeout hit: the shell-level `timeout` wrapper above
+                # should have already killed the test process, but if the
+                # daemon call itself is stuck (e.g. a runaway subprocess
+                # escaping timeout's supervision, or a Docker-side stall),
+                # forcibly kill the container so this call can never hang
+                # the caller indefinitely.
+                try:
+                    container.kill()
+                except docker.errors.APIError:
+                    pass
+                worker.join(timeout=WATCHDOG_GRACE_SECONDS)
                 return SandboxResult(
-                    passed=False, exit_code=-1, stdout=stdout,
-                    stderr="Execution exceeded timeout and was killed.",
+                    passed=False, exit_code=-1,
+                    stdout=result_holder.get("stdout", ""),
+                    stderr="Execution exceeded the hard timeout and the "
+                           "sandbox container was forcibly killed.",
                     timed_out=True, patch_applied=True,
                     duration_seconds=time.time() - start,
                 )
 
-            exit_info = self.client.api.exec_inspect(exec_id)
-            exit_code = exit_info.get("ExitCode", -1)
-            stdout = b"".join(output_chunks).decode(errors="ignore")
+            if "error" in result_holder:
+                return SandboxResult(
+                    passed=False, exit_code=-1, stdout="",
+                    stderr=f"Sandbox exec error: {result_holder['error']}",
+                    patch_applied=True, duration_seconds=time.time() - start,
+                )
+
+            exit_code = result_holder.get("exit_code", -1)
+            stdout = result_holder.get("stdout", "")
+            # exit code 124 is `timeout`'s own signal that IT killed the
+            # process -- treat this the same as our watchdog timing out.
+            if exit_code == 124:
+                return SandboxResult(
+                    passed=False, exit_code=exit_code, stdout=stdout,
+                    stderr=f"Test execution exceeded {self.timeout_seconds}s "
+                           "and was killed by the in-container `timeout` wrapper.",
+                    timed_out=True, patch_applied=True,
+                    duration_seconds=time.time() - start,
+                )
+
             tests_passed, tests_failed = _parse_pytest_output(stdout)
 
             return SandboxResult(

@@ -18,6 +18,7 @@ venv/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/*.tsbuildinfo
 
 # --- Generated data & model artifacts (large, not source) ---
 data/swebench/raw/

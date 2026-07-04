@@ -19,6 +19,7 @@ branches complete, using the `operator.add` reducer on `state["candidates"]`
 """
 from __future__ import annotations
 
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
 from agents.nodes.coder_agent import coder_node_run1, coder_node_run2
@@ -103,7 +104,20 @@ def build_graph():
 
 def run_instance(initial_state: dict) -> dict:
     """Runs the full pipeline for one SWE-bench instance and returns the
-    final state, including `final_patch`, `resolved`, and `explanation`."""
+    final state, including `final_patch`, `resolved`, and `explanation`.
+
+    Two independent guardrails bound how long this can run:
+      1. `max_retries` in state (default 3, enforced in
+         agents/nodes/patch_ranker.py) is the *intended* control -- the
+         pipeline should never need more than a few self-correction passes.
+      2. `recursion_limit` below is a hard, LangGraph-level ceiling that
+         fires regardless of #1 -- e.g. if a future change introduced a bug
+         in the retry-counting logic itself, this still guarantees the graph
+         cannot loop indefinitely. 60 gives comfortable headroom for the
+         intended ~4 attempts (1 initial + 3 retries) x ~9-10 node
+         executions each, while still being a hard stop an order of
+         magnitude below "runs forever."
+    """
     app = build_graph()
     default_state = {
         "candidates": [],
@@ -114,7 +128,22 @@ def run_instance(initial_state: dict) -> dict:
         "error_log": [],
     }
     state = {**default_state, **initial_state}
-    return app.invoke(state)
+
+    try:
+        return app.invoke(state, config={"recursion_limit": 60})
+    except GraphRecursionError:
+        return {
+            **state,
+            "resolved": False,
+            "final_patch": None,
+            "status": "failed",
+            "explanation": (
+                "Pipeline exceeded its hard recursion limit (60 graph steps) "
+                "without converging. This should not happen under normal "
+                "operation given max_retries=3 -- treat this as a bug report "
+                "if it occurs, not a normal 'no fix found' outcome."
+            ),
+        }
 
 
 if __name__ == "__main__":
