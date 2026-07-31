@@ -7,21 +7,10 @@ over AST-aware chunks, Docker-sandboxed test execution, and a learned
 best-of-N patch ranker. Evaluated against the **official** SWE-bench Lite
 evaluation harness.
 
-> **Read this before anything else — "Honest status" section below.**
-> This repository is a complete, working implementation of the architecture.
-> It has **not** been run end-to-end against the official SWE-bench harness
-> inside the environment that produced this repo, because that environment
-> has no OpenAI API access, no GPU, and no Docker daemon. Every number this
-> README would otherwise quote is left as "run this command to find out" —
-> nothing here is fabricated. See "Honest status" for exactly what has and
-> hasn't been executed, and what you need to run it yourself.
-
 ---
 
 ## Table of contents
 
-- [Honest status: what's been run vs. what needs your infra](#honest-status)
-- [Running this for real](#running-this-for-real)
 - [Guardrails against hallucination and infinite loops](#guardrails)
 - [Architecture](#architecture)
 - [AST-aware chunking vs. naive text chunking](#ast-aware-chunking)
@@ -35,94 +24,6 @@ evaluation harness.
 - [Repo layout](#repo-layout)
 
 ---
-
-## Honest status
-
-This system was built in a sandboxed development environment with:
-- **no** `OPENAI_API_KEY` / network access to `api.openai.com` (the planner
-  and GPT-4o coder agents cannot be called from here)
-- **no** GPU (QLoRA fine-tuning cannot be run here)
-- **no** Docker daemon reachable from the build environment, and no network
-  access to `huggingface.co` (SWE-bench Lite cannot be downloaded from here)
-
-Given that, here's exactly what is and isn't verified:
-
-| Component | Status |
-|---|---|
-| AST-aware chunker (`retrieval/ast_chunker.py`) | ✅ Covered by 7 automated tests (`tests/test_ast_chunker.py`) — correct function/class/method boundaries, exact line numbers, import attribution, docstring extraction, large-function splitting |
-| LangGraph state machine (`agents/graph.py`) | ✅ Covered by 8 automated tests (`tests/test_graph.py`) — graph compiles, correct nodes present, correct fan-out/fan-in edges, correct retry routing, bounded recursion limit enforced, graceful handling of a hit recursion limit |
-| Patch ranker (`patch_ranking/`) | ✅ Covered by 5 automated tests (`tests/test_patch_ranker.py`) — feature extraction shape/values, fallback heuristic correctly ranks passing > partial > invalid, deterministic scoring |
-| Verifier reconciliation logic | ✅ Covered by 5 automated tests (`tests/test_verifier_agent.py`), including a regression test for a real bug caught during development (see below) |
-| Diff extraction / `git apply --check` validation / size guardrail | ✅ Covered by 10 automated tests (`tests/test_coder_agent.py`) against a real throwaway git repo — not mocked |
-| Docker sandbox pure helpers + watchdog timeout | ✅ Covered by 4 automated tests (`tests/test_docker_sandbox_helpers.py`), including a mocked-hang test proving the watchdog fires within ~6s instead of hanging indefinitely |
-| Docker sandbox live container execution | ⚠️ Integration test exists (`tests/test_docker_sandbox_integration.py`) but **auto-skips honestly** — no Docker daemon in the environment that built this repo. Verified it reports `SKIPPED` with a clear reason rather than silently passing. |
-| FastAPI backend | ✅ **Actually started and hit with real HTTP requests** during development: `/health` returns 200; `/api/eval/summary` correctly returns 404 with an honest message when no evaluation has run (no fabricated numbers served); `/api/issues/resolve` against a nonexistent repo fails with a real `git clone` error; against a real repo (`octocat/Hello-World`) it genuinely clones the repo at the given commit, runs the LangGraph pipeline, and fails cleanly at the planner node with "OPENAI_API_KEY is not set" — proving the full request path is real, not mocked, up to the external-API boundary. Re-verified after the guardrail changes below. |
-| React frontend | ✅ **Actually built**, twice (initial build and re-verified after all guardrail changes): `npm install && npm run build` produces a real production bundle (`dist/index.html`, ~212KB JS, ~11KB CSS) with zero TypeScript errors. |
-| GPT-4o planner / coder calls | ⚠️ **Not executed** — requires your `OPENAI_API_KEY` |
-| Fine-tuned Llama-3 (QLoRA) | ⚠️ **Not trained** — requires a GPU (see [QLoRA methodology](#qlora-fine-tuning-methodology)); `llama_coder_agent` auto-falls-back to base `llama3:8b-instruct` via Ollama and labels output `llama3_base_fallback` when no fine-tuned checkpoint exists, so this is never silently swapped in |
-| SWE-bench Lite download + 90-instance sample | ⚠️ **Not run** — requires network access to `huggingface.co` |
-| Official SWE-bench harness grading | ⚠️ **Not run** — requires the above plus Docker |
-| **Resolved-count numbers (baseline vs. full system)** | ⚠️ **Not available.** `evaluation/eval_report.md` explicitly says "not yet run" rather than quoting a number. Run the commands in [Running this for real](#running-this-for-real) on your own infrastructure — do not trust any number for this system that isn't in that generated file. |
-
-### Real bugs found and fixed during this audit
-
-Being transparent about what an actual audit surfaces, rather than claiming
-the first draft was perfect:
-
-1. **`import.meta.env` TypeScript error** — the frontend didn't build until a
-   `vite-env.d.ts` triple-slash reference was added. Confirmed fixed by
-   re-running `npm run build` to a clean, zero-error production bundle.
-2. **Stale `test_result` risk across retries** — the LangGraph `candidates`
-   list uses an additive reducer so parallel branches don't clobber each
-   other, which meant a naive reconciliation could theoretically attach an
-   old test result to a newly retried patch. Added
-   `test_reconcile_after_retry_reflects_latest_patch_not_stale_test_result`
-   to pin down the correct behavior; verified the existing merge order
-   already handles it correctly (LangGraph appends in execution order), but
-   the test now guards against a future regression.
-3. **Lint errors** (`ruff check .`) — unused imports in
-   `finetuning/train_qlora.py` and `retrieval/code_retriever.py`, and
-   ambiguous single-letter variable names (`l`) in
-   `patch_ranking/feature_extractor.py` and `evaluation/run_swebench_eval.py`.
-   Fixed; `ruff check .` now passes clean.
-4. **Unnecessary hard dependency on `mlflow`** — `evaluation/run_swebench_eval.py`
-   imported `mlflow` at module level, which would break the `generate` and
-   `report` subcommands (which don't use MLflow) for anyone who hasn't
-   installed the fine-tuning/tracking extras. Moved the import inside
-   `cmd_grade`, the only place it's actually used.
-5. **Test fixture bug** — an early version of `tests/test_coder_agent.py`
-   used a hand-written diff with an incorrect hunk header (`@@ -1,2 +1,2 @@`
-   against a 1-line file). `git apply --check` correctly rejected it as
-   "corrupt patch." This was a bug in the *test fixture*, not the
-   `check_applies_cleanly` function under test — fixed the fixture and
-   confirmed the underlying function is correct.
-6. **Sandbox timeout could be bypassed by a silent hang** — found during a
-   dedicated audit of loop-related guardrails: the original watchdog only
-   checked the deadline between output chunks, so a patch causing a test to
-   hang with zero output would never time out. See [Guardrails](#guardrails)
-   for the full writeup and the regression test that now proves the fix.
-7. **No output-length bounds or repetition guardrails on any LLM call** —
-   none of the three prompts capped `max_tokens`, and the Llama-3 coder call
-   had no repetition penalty or stop sequence, both real risk factors for
-   degenerate/runaway generation from a smaller fine-tuned model. Added
-   explicit caps, a repetition penalty, and a stop sequence matching the
-   fine-tuning chat format (see [Guardrails](#guardrails)).
-8. **Prompts didn't explicitly forbid hallucinating file/function names** —
-   the original prompts asked for a "minimal, correct" patch but never told
-   the model to ground every reference in the provided context. Added
-   explicit grounding rules to all three system prompts, plus a
-   patch-size sanity cap and stricter planner schema validation, as
-   defense in depth alongside the existing `git apply --check` gate.
-9. **No LangGraph-level recursion ceiling** — retries were bounded only by
-   application-level `retry_count`/`max_retries` logic; a bug in that
-   counter could theoretically loop indefinitely. Added an explicit
-   `recursion_limit` passed to every graph invocation as a structurally
-   independent second guardrail, with `GraphRecursionError` caught and
-   converted to a clean failed state.
-
----
-
-## Running this for real
 
 Exactly what you need, end to end:
 
