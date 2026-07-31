@@ -1,3 +1,59 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --bg-app: #f6f6f7;
+  --bg-surface: #ffffff;
+  --bg-elevated: #f1f1f3;
+  --bg-overlay: #e7e7ea;
+
+  --border-subtle: rgba(0, 0, 0, 0.06);
+  --border-default: rgba(0, 0, 0, 0.1);
+  --border-strong: rgba(0, 0, 0, 0.16);
+
+  --text-primary: #18181b;
+  --text-secondary: #52525b;
+  --text-tertiary: #71717a;
+
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-muted: rgba(79, 70, 229, 0.08);
+
+  --success: #059669;
+  --success-muted: rgba(5, 150, 105, 0.08);
+  --warning: #d97706;
+  --warning-muted: rgba(217, 119, 6, 0.08);
+  --danger: #e11d48;
+  --danger-muted: rgba(225, 29, 72, 0.08);
+  --info: #0284c7;
+  --info-muted: rgba(2, 132, 199, 0.08);
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+}
+
+* {
+  scrollbar-color: var(--bg-elevated) transparent;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--bg-elevated);
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-track {
+  background-color: transparent;
+}
